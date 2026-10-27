@@ -351,3 +351,97 @@ diff --git a/esphome/components/i2s_audio/speaker/i2s_audio_speaker_standard.cpp
      }
    }
  
+diff --git a/esphome/components/audio/audio_decoder.cpp b/esphome/components/audio/audio_decoder.cpp
+--- a/esphome/components/audio/audio_decoder.cpp
++++ b/esphome/components/audio/audio_decoder.cpp
+@@ -4,6 +4,10 @@
+ 
+ #include "esphome/core/hal.h"
+ #include "esphome/core/log.h"
++
++#ifdef USE_AUDIO_MP3_SUPPORT
++#include "esp_heap_caps.h"
++#endif
+ 
+ namespace esphome::audio {
+ 
+@@ -87,6 +91,8 @@
+ #endif
+ #ifdef USE_AUDIO_MP3_SUPPORT
+     case AudioFileType::MP3:
++      this->mp3_start_failures_ = 0;
++      this->mp3_retry_delay_ms_ = 0;
+       this->mp3_decoder_ = make_unique<micro_mp3::Mp3Decoder>();
+       this->free_buffer_required_ =
+           this->output_transfer_buffer_->capacity();  // Adjusted and reallocated after reading the header
+@@ -295,6 +301,26 @@
+ 
+ #ifdef USE_AUDIO_MP3_SUPPORT
+ FileDecoderState AudioDecoder::decode_mp3_() {
++  if (this->mp3_start_failures_ >= 4) {
++    return FileDecoderState::FAILED;
++  }
++  if (this->mp3_retry_delay_ms_ != 0) {
++    // Unsigned elapsed time handles millis() rollover. Return to the caller so stop/track changes
++    // are checked between attempts; never block the decoding task for the entire backoff.
++    if (uint32_t(millis() - this->mp3_retry_started_ms_) < this->mp3_retry_delay_ms_) {
++      delay(1);
++      return FileDecoderState::IDLE;
++    }
++    this->mp3_retry_delay_ms_ = 0;
++  }
++
++  if (!this->mp3_decoder_->is_initialized()) {
++    ESP_LOGD(TAG, "MP3 init attempt %u/4: internal free=%u largest=%u; DMA free=%u largest=%u",
++             unsigned(this->mp3_start_failures_ + 1), unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
++             unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
++             unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)),
++             unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)));
++  }
+   // microMP3's samples_decoded value is samples per channel; e.g., what ESPHome typically calls an audio frame.
+   // microMP3 uses the term frame to refer to an MP3 frame: an encoded packet that contains multiple audio frames.
+   size_t bytes_consumed = 0;
+@@ -306,6 +332,29 @@
+       this->input_buffer_->data(), this->input_buffer_->available(), this->output_transfer_buffer_->get_buffer_end(),
+       this->output_transfer_buffer_->free(), bytes_consumed, samples_decoded);
+ 
++  if (result == micro_mp3::MP3_ALLOCATION_FAILED && !this->audio_stream_info_.has_value() &&
++      !this->mp3_decoder_->is_initialized()) {
++    // micro-mp3 0.4.0 initializes before consuming input and frees partial allocations itself.
++    // Keep the same decoder/source and original bytes; never restart the HTTP stream or discard its header.
++    ++this->mp3_start_failures_;
++    ESP_LOGW(TAG, "MP3 allocation failed (%u/4): internal free=%u largest=%u; DMA free=%u largest=%u",
++             unsigned(this->mp3_start_failures_), unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
++             unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
++             unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)),
++             unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)));
++    if (this->mp3_start_failures_ >= 4) {
++      ESP_LOGE(TAG, "MP3 initialization allocation retries exhausted");
++      return FileDecoderState::FAILED;
++    }
++    this->mp3_retry_started_ms_ = millis();
++    this->mp3_retry_delay_ms_ = 250U << (this->mp3_start_failures_ - 1);
++    return FileDecoderState::IDLE;
++  }
++
++  if (this->mp3_start_failures_ != 0 && this->mp3_decoder_->is_initialized()) {
++    ESP_LOGI(TAG, "MP3 initialization recovered after %u allocation failure(s)", unsigned(this->mp3_start_failures_));
++    this->mp3_start_failures_ = 0;
++  }
+   this->input_buffer_->consume(bytes_consumed);
+ 
+   if (result == micro_mp3::MP3_OK) {
+diff --git a/esphome/components/audio/audio_decoder.h b/esphome/components/audio/audio_decoder.h
+--- a/esphome/components/audio/audio_decoder.h
++++ b/esphome/components/audio/audio_decoder.h
+@@ -128,6 +128,10 @@
+ #ifdef USE_AUDIO_MP3_SUPPORT
+   FileDecoderState decode_mp3_();
+   std::unique_ptr<micro_mp3::Mp3Decoder> mp3_decoder_;
++  // Owned only by the decoding task. Retries never consume input or sleep for the whole backoff.
++  uint8_t mp3_start_failures_{0};
++  uint32_t mp3_retry_started_ms_{0};
++  uint32_t mp3_retry_delay_ms_{0};
+ #endif
+ #ifdef USE_AUDIO_OPUS_SUPPORT
+   FileDecoderState decode_opus_();
