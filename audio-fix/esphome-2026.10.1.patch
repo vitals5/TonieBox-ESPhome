@@ -1,0 +1,353 @@
+diff --git a/esphome/components/i2s_audio/speaker/i2s_audio_spdif.cpp b/esphome/components/i2s_audio/speaker/i2s_audio_spdif.cpp
+--- a/esphome/components/i2s_audio/speaker/i2s_audio_spdif.cpp
++++ b/esphome/components/i2s_audio/speaker/i2s_audio_spdif.cpp
+@@ -200,7 +200,7 @@
+     xQueueReset(this->i2s_event_queue_);
+     const i2s_event_callbacks_t callbacks = {.on_sent = i2s_on_sent_cb};
+     i2s_channel_register_event_callback(this->tx_handle_, &callbacks, this);
+-    successful_setup = i2s_channel_enable(this->tx_handle_) == ESP_OK;
++    successful_setup = this->enable_i2s_channel_() == ESP_OK;
+   }
+ 
+   if (!successful_setup) {
+diff --git a/esphome/components/i2s_audio/speaker/i2s_audio_speaker.cpp b/esphome/components/i2s_audio/speaker/i2s_audio_speaker.cpp
+--- a/esphome/components/i2s_audio/speaker/i2s_audio_speaker.cpp
++++ b/esphome/components/i2s_audio/speaker/i2s_audio_speaker.cpp
+@@ -13,6 +13,7 @@
+ #include "esphome/core/log.h"
+ 
+ #include "esp_timer.h"
++#include "esp_heap_caps.h"
+ 
+ #include <cmath>
+ 
+@@ -66,11 +67,22 @@
+ void I2SAudioSpeakerBase::loop() {
+   uint32_t event_group_bits = xEventGroupGetBits(this->event_group_);
+ 
+-  // A stop that arrives while stopped cancels any start that has not been processed yet
++  if (event_group_bits & (SpeakerEventGroupBits::COMMAND_STOP | SpeakerEventGroupBits::COMMAND_STOP_GRACEFULLY)) {
++    this->start_failures_ = 0;
++    this->cancel_timeout("audio-start");
++    this->status_clear_error();
++  }
++
++  // stop_() cancels older starts. A later start bit must survive cancellation of a pending startup.
+   constexpr uint32_t stop_bits = SpeakerEventGroupBits::COMMAND_STOP | SpeakerEventGroupBits::COMMAND_STOP_GRACEFULLY;
+-  if ((event_group_bits & stop_bits) && (this->state_ == speaker::STATE_STOPPED)) {
+-    xEventGroupClearBits(this->event_group_, stop_bits | SpeakerEventGroupBits::COMMAND_START);
+-    event_group_bits &= ~(stop_bits | SpeakerEventGroupBits::COMMAND_START);
++  if ((event_group_bits & stop_bits) && this->speaker_task_handle_ == nullptr &&
++      (this->state_ == speaker::STATE_STOPPED || this->state_ == speaker::STATE_STARTING)) {
++    xEventGroupClearBits(this->event_group_, stop_bits);
++    event_group_bits &= ~stop_bits;
++    if (this->tx_handle_ != nullptr) {
++      this->stop_i2s_driver_();  // A cancelled partial startup must also release its channel.
++    }
++    this->state_ = speaker::STATE_STOPPED;
+   }
+ 
+   if ((event_group_bits & SpeakerEventGroupBits::COMMAND_START) && (this->state_ == speaker::STATE_STOPPED)) {
+@@ -87,6 +99,8 @@
+     ESP_LOGV(TAG, "Started");
+     xEventGroupClearBits(this->event_group_, SpeakerEventGroupBits::TASK_RUNNING);
+     this->state_ = speaker::STATE_RUNNING;
++    this->start_failures_ = 0;
++    this->cancel_timeout("audio-start");
+ #ifdef USE_AUDIO_DAC
+     // The task raises TASK_RUNNING only after enabling the channel, so the clocks are already running
+     if (this->audio_dac_ != nullptr) {
+@@ -100,30 +114,40 @@
+     this->state_ = speaker::STATE_STOPPING;
+   }
+   if (event_group_bits & SpeakerEventGroupBits::TASK_STOPPED) {
++    if (this->status_has_error()) {
++      return;  // A failed cleanup is latched until an explicit stop permits another attempt.
++    }
+     ESP_LOGD(TAG, "Stopped");
+ 
+-    vTaskDelete(this->speaker_task_handle_);
+-    this->speaker_task_handle_ = nullptr;
++    if (this->speaker_task_handle_ != nullptr) {
++      vTaskDelete(this->speaker_task_handle_);
++      this->speaker_task_handle_ = nullptr;
++    }
+ 
+     this->stop_i2s_driver_();
+-    // ALL_BITS includes COMMAND_START. Take the bits from the clear itself, not from the snapshot at
+-    // the top of loop(): the audio source's task can raise a start at any point above, including
+-    // during stop_i2s_driver_(), and nothing would ever re-issue it.
+-    const EventBits_t bits_before_clear = xEventGroupClearBits(this->event_group_, SpeakerEventGroupBits::ALL_BITS);
+-    if (bits_before_clear & SpeakerEventGroupBits::COMMAND_START) {
+-      ESP_LOGD(TAG, "Start requested while stopping; keeping the request");
+-      xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::COMMAND_START);
+-    }
++    if (this->tx_handle_ != nullptr) {
++      // The task is gone. Consume stop commands so they cannot repeatedly clear the cleanup error.
++      xEventGroupClearBits(this->event_group_, stop_bits);
++      return;  // Retain TASK_STOPPED and ownership; an explicit stop permits cleanup to retry.
++    }
++    // Leave COMMAND_START untouched: clearing then re-posting it races a newer stop command.
++    const EventBits_t bits_before_clear = xEventGroupClearBits(
++        this->event_group_, SpeakerEventGroupBits::ALL_BITS & ~SpeakerEventGroupBits::COMMAND_START);
+     this->status_clear_error();
++    const bool retry_setup = (bits_before_clear & SpeakerEventGroupBits::ERR_ESP_NO_MEM) &&
++                             !(bits_before_clear & stop_bits);
++    if (bits_before_clear & stop_bits) {
++      // A stop can arrive after the loop snapshot, including during driver cleanup.
++      this->start_failures_ = 0;
++      this->cancel_timeout("audio-start");
++    } else if (retry_setup) {
++      this->retry_start_("speaker task setup");
++    }
+ 
+     this->on_task_stopped();
+ 
+-    this->state_ = speaker::STATE_STOPPED;
+-  }
+-
+-  if (event_group_bits & SpeakerEventGroupBits::ERR_ESP_NO_MEM) {
+-    ESP_LOGE(TAG, "Speaker task setup failed (allocation, preload, or channel enable)");
+-    xEventGroupClearBits(this->event_group_, SpeakerEventGroupBits::ERR_ESP_NO_MEM);
++    // The loop owns state: a newer stop bit cancels this retry on the next pass.
++    this->state_ = retry_setup ? speaker::STATE_STARTING : speaker::STATE_STOPPED;
+   }
+ 
+   // Handle the speaker's state
+@@ -133,14 +157,20 @@
+         break;
+       }
+ 
+-      // Still starting up or winding down from a previous run
+-      if ((this->tx_handle_ != nullptr) || (this->speaker_task_handle_ != nullptr)) {
++      // Never clean a channel while its task can still access it.
++      if (this->speaker_task_handle_ != nullptr) {
+         break;
+       }
++      // A partial driver/task-creation failure may have retained a channel after failed deletion.
++      if (this->tx_handle_ != nullptr) {
++        this->stop_i2s_driver_();
++        if (this->tx_handle_ != nullptr) {
++          break;  // Cleanup error remains latched; no second channel or busy retry loop.
++        }
++      }
+ 
+       if (this->start_i2s_driver(this->audio_stream_info_) != ESP_OK) {
+-        ESP_LOGE(TAG, "Driver failed to start; retrying in 1 second");
+-        this->status_momentary_error("driver-failure", 1000);
++        this->retry_start_("driver initialization");
+         break;
+       }
+ 
+@@ -152,8 +182,7 @@
+                   &this->speaker_task_handle_);
+ 
+       if (this->speaker_task_handle_ == nullptr) {
+-        ESP_LOGE(TAG, "Task failed to start, retrying in 1 second");
+-        this->status_momentary_error("task-failure", 1000);
++        this->retry_start_("task creation");
+         this->stop_i2s_driver_();  // Stops the driver to return the lock; will be reloaded in next attempt
+       }
+       break;
+@@ -234,9 +263,11 @@
+ }
+ 
+ void I2SAudioSpeakerBase::start() {
+-  if (!this->is_ready() || this->is_failed() || this->status_has_error())
++  if (!this->is_ready() || this->is_failed())
+     return;
+-  if ((this->state_ == speaker::STATE_STARTING) || (this->state_ == speaker::STATE_RUNNING))
++  const auto commands = xEventGroupGetBits(this->event_group_);
++  if (((this->state_ == speaker::STATE_STARTING) || (this->state_ == speaker::STATE_RUNNING)) &&
++      !(commands & (SpeakerEventGroupBits::COMMAND_STOP | SpeakerEventGroupBits::COMMAND_STOP_GRACEFULLY)))
+     return;
+ 
+   xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::COMMAND_START);
+@@ -250,7 +281,8 @@
+   if (!this->is_ready() || this->is_failed())
+     return;
+ 
+-  // Always set the bit, even when stopped, so loop() can cancel a start that is still pending
++  // Cancel an older pending start. A start posted after this stop remains queued until cleanup finishes.
++  xEventGroupClearBits(this->event_group_, SpeakerEventGroupBits::COMMAND_START);
+   if (wait_on_empty) {
+     xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::COMMAND_STOP_GRACEFULLY);
+   } else {
+@@ -270,9 +302,7 @@
+   err = i2s_channel_init_std_mode(this->tx_handle_, &std_cfg);
+   if (err != ESP_OK) {
+     ESP_LOGE(TAG, "Failed to initialize I2S channel");
+-    i2s_del_channel(this->tx_handle_);
+-    this->tx_handle_ = nullptr;
+-    this->parent_->unlock();
++    this->stop_i2s_driver_();
+     return err;
+   }
+ 
+@@ -293,20 +323,57 @@
+ 
+   if (this->i2s_event_queue_ == nullptr || this->write_records_queue_ == nullptr) {
+     ESP_LOGE(TAG, "Failed to allocate I2S event queue(s)");
+-    i2s_del_channel(this->tx_handle_);
+-    this->tx_handle_ = nullptr;
+-    this->parent_->unlock();
++    this->stop_i2s_driver_();
+     return ESP_ERR_NO_MEM;
+   }
+ 
+   return ESP_OK;
++}
++
++void I2SAudioSpeakerBase::retry_start_(const char *stage) {
++  ++this->start_failures_;
++  ESP_LOGE(TAG, "%s failed (attempt %u/4): DMA free=%u largest=%u; internal free=%u largest=%u", stage,
++           this->start_failures_, (unsigned) heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
++           (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
++           (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
++           (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
++  if (this->start_failures_ >= 4) {
++    this->cancel_timeout("audio-start");
++    ESP_LOGE(TAG, "Start retries exhausted; send stop before trying playback again");
++    this->status_set_error(LOG_STR("Audio start retries exhausted"));
++  } else {
++    this->status_momentary_error("audio-start", 250U << (this->start_failures_ - 1));
++  }
++}
++
++esp_err_t I2SAudioSpeakerBase::enable_i2s_channel_() {
++  const esp_err_t err = i2s_channel_enable(this->tx_handle_);
++  this->channel_enabled_ = err == ESP_OK;
++  return err;
++}
++
++void I2SAudioSpeakerBase::disable_i2s_channel_() {
++  if (this->channel_enabled_) {
++    const esp_err_t err = i2s_channel_disable(this->tx_handle_);
++    if (err == ESP_OK) {
++      this->channel_enabled_ = false;
++    } else {
++      ESP_LOGE(TAG, "I2S disable failed: %s", esp_err_to_name(err));
++    }
++  }
+ }
+ 
+ void I2SAudioSpeakerBase::stop_i2s_driver_() {
+   if (this->tx_handle_ != nullptr) {
+-    i2s_channel_disable(this->tx_handle_);
+-    i2s_del_channel(this->tx_handle_);
++    this->disable_i2s_channel_();
++    const esp_err_t err = i2s_del_channel(this->tx_handle_);
++    if (err != ESP_OK) {
++      ESP_LOGE(TAG, "I2S delete failed: %s", esp_err_to_name(err));
++      this->status_set_error(LOG_STR("I2S cleanup failed"));
++      return;  // Keep the handle and bus ownership; never create a second channel over it.
++    }
+     this->tx_handle_ = nullptr;
++    this->channel_enabled_ = false;
+ 
+     // i2s_del_channel() leaves dout wired to this port's data-out signal in the GPIO matrix: it only
+     // clears an internal reservation mask, never the esp_rom_gpio_connect_out_signal() routing that
+@@ -315,6 +382,14 @@
+     // SPDIF optical transmitter would otherwise stay lit, and an analog DAC would emit noise.
+     this->park_dout_pin_();
+   }
++  if (this->i2s_event_queue_ != nullptr) {
++    vQueueDelete(this->i2s_event_queue_);
++    this->i2s_event_queue_ = nullptr;
++  }
++  if (this->write_records_queue_ != nullptr) {
++    vQueueDelete(this->write_records_queue_);
++    this->write_records_queue_ = nullptr;
++  }
+   this->parent_->unlock();
+ }
+ 
+@@ -341,7 +416,7 @@
+ 
+ void I2SAudioSpeakerBase::drain_lockstep_(uint32_t extra_frames) {
+   // Stop DMA so no more completion events arrive while the queues are rebuilt
+-  i2s_channel_disable(this->tx_handle_);
++  this->disable_i2s_channel_();
+   xEventGroupClearBits(this->event_group_, SpeakerEventGroupBits::ERR_DROPPED_EVENT);
+ 
+   uint32_t frames = extra_frames;
+diff --git a/esphome/components/i2s_audio/speaker/i2s_audio_speaker.h b/esphome/components/i2s_audio/speaker/i2s_audio_speaker.h
+--- a/esphome/components/i2s_audio/speaker/i2s_audio_speaker.h
++++ b/esphome/components/i2s_audio/speaker/i2s_audio_speaker.h
+@@ -128,6 +128,13 @@
+ 
+   /// @brief Stops the I2S driver and unlocks the I2S port
+   void stop_i2s_driver_();
++  esp_err_t enable_i2s_channel_();
++  void disable_i2s_channel_();
++  void retry_start_(const char *stage);
++
++  uint8_t start_failures_{0};
++  // Written by the speaker task; read by loop only after TASK_STOPPED handoff.
++  bool channel_enabled_{false};
+ 
+   /// @brief Detaches dout from the I2S signal and drives it low
+   void park_dout_pin_();
+@@ -143,7 +150,7 @@
+   /// @return false if the preload or the channel enable failed; the caller should restart the task
+   template<typename F> bool resync_lockstep_(uint32_t extra_frames, F &&preload) {
+     this->drain_lockstep_(extra_frames);
+-    return preload() && (i2s_channel_enable(this->tx_handle_) == ESP_OK);
++    return preload() && (this->enable_i2s_channel_() == ESP_OK);
+   }
+ 
+   /// @brief Disables the channel, credits ``extra_frames`` plus every real frame still recorded as in flight,
+diff --git a/esphome/components/i2s_audio/speaker/i2s_audio_speaker_standard.cpp b/esphome/components/i2s_audio/speaker/i2s_audio_speaker_standard.cpp
+--- a/esphome/components/i2s_audio/speaker/i2s_audio_speaker_standard.cpp
++++ b/esphome/components/i2s_audio/speaker/i2s_audio_speaker_standard.cpp
+@@ -131,7 +131,12 @@
+       // audio_source is nullptr if the ring buffer fails to allocate
+       this->audio_ring_buffer_ = temp_ring_buffer;
+       successful_setup = true;
++    } else {
++      ESP_LOGE(TAG, "Audio source allocation failed (ring=%u, transfer=%u)", (unsigned) ring_buffer_size,
++               (unsigned) dma_buffer_input_bytes);
+     }
++  } else {
++    ESP_LOGE(TAG, "Silence buffer allocation failed (%u bytes)", (unsigned) dma_buffer_bytes);
+   }
+ 
+   // Preload every DMA descriptor with silence and push a matching zero-real-frames record per buffer, so every
+@@ -141,14 +146,14 @@
+       size_t bytes_loaded = 0;
+       esp_err_t err = i2s_channel_preload_data(this->tx_handle_, silence_buffer, dma_buffer_bytes, &bytes_loaded);
+       if (err != ESP_OK || bytes_loaded != dma_buffer_bytes) {
+-        ESP_LOGV(TAG, "Failed to preload silence into DMA buffer %u (err=%d, loaded=%u)", (unsigned) i, (int) err,
++        ESP_LOGE(TAG, "Failed to preload silence into DMA buffer %u (err=%d, loaded=%u)", (unsigned) i, (int) err,
+                  (unsigned) bytes_loaded);
+         return false;
+       }
+       uint32_t zero_real_frames = 0;
+       if (xQueueSend(this->write_records_queue_, &zero_real_frames, 0) != pdTRUE) {
+         // Should never happen: the queue was just reset and is sized for DMA_BUFFERS_COUNT * 2 entries.
+-        ESP_LOGV(TAG, "Failed to push preload write record");
++        ESP_LOGE(TAG, "Failed to push preload write record");
+         return false;
+       }
+     }
+@@ -163,11 +168,16 @@
+     // Register the on_sent callback BEFORE enabling the channel so the very first transmitted buffer
+     // generates a queued event that pairs with the first preloaded silence record.
+     const i2s_event_callbacks_t callbacks = {.on_sent = i2s_on_sent_cb};
+-    i2s_channel_register_event_callback(this->tx_handle_, &callbacks, this);
+-
+-    if (i2s_channel_enable(this->tx_handle_) != ESP_OK) {
+-      ESP_LOGV(TAG, "Failed to enable I2S channel");
++    const esp_err_t callback_err = i2s_channel_register_event_callback(this->tx_handle_, &callbacks, this);
++    if (callback_err != ESP_OK) {
++      ESP_LOGE(TAG, "Failed to register I2S callback: %s", esp_err_to_name(callback_err));
+       successful_setup = false;
++    } else {
++      const esp_err_t enable_err = this->enable_i2s_channel_();
++      if (enable_err != ESP_OK) {
++        ESP_LOGE(TAG, "Failed to enable I2S channel: %s", esp_err_to_name(enable_err));
++        successful_setup = false;
++      }
+     }
+   }
+ 
