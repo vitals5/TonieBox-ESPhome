@@ -112,9 +112,16 @@ esp32:
 external_components:
   - source:
       type: git
-      url: https://github.com/chunckus-aurelius/TonieBox-ESPhome
+      url: https://github.com/vitals5/TonieBox-ESPhome
       ref: main
     components: [trf7962a, dac3100, lis3dh]
+  - source:
+      type: git
+      url: https://github.com/vitals5/TonieBox-ESPhome
+      ref: main
+      path: audio-fix/components
+    components: [i2s_audio, audio]
+    refresh: 0s
 
 logger:
   level: DEBUG
@@ -260,7 +267,7 @@ speaker:
     dac_type: external
     i2s_dout_pin: GPIO10  # I2S_DATA_GPIO
     sample_rate: 44100      # must match the pipelines below
-    buffer_duration: 100ms  # 150ms does not fit at this rate
+    buffer_duration: 60ms  # 150ms does not fit at this rate
 
   - platform: mixer
     id: toniebox_mixer
@@ -293,7 +300,7 @@ media_player:
     # Short on purpose: ESPHome prefixes friendly_name, so a longer name here
     # would repeat the device name inside the entity ID.
     name: "Speaker"
-    buffer_size: 32768  # the MP3 decoder itself costs ~116KB on top of this
+    buffer_size: 16384  # the MP3 decoder itself costs ~116KB on top of this
     media_pipeline:
       speaker: toniebox_media_resampling_input
       format: MP3
